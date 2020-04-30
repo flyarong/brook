@@ -12,6 +12,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+// +build linux darwin windows
+
 package brook
 
 import (
@@ -19,23 +21,26 @@ import (
 	"log"
 	"net"
 
+	"github.com/txthinking/brook/limits"
 	"github.com/txthinking/brook/sysproxy"
 	"github.com/txthinking/gotun2socks"
 	"github.com/txthinking/gotun2socks/tun"
+	"github.com/txthinking/runnergroup"
 )
 
-// VPN.
-type VPN struct {
+// Tun.
+type Tun struct {
 	Client             *Client
 	Tunnel             *Tunnel
 	Tun                *gotun2socks.Tun2Socks
 	ServerIP           string
 	TunGateway         string
 	OriginalDNSServers []string
+	RunnerGroup        *runnergroup.RunnerGroup
 }
 
-// NewVPN.
-func NewVPN(addr, server, password, dns string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int, tunDevice, tunIP, tunGateway, tunMask string) (*VPN, error) {
+// NewTun.
+func NewTun(addr, server, password, dns string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int, tunDevice, tunIP, tunGateway, tunMask string) (*Tun, error) {
 	ds, err := sysproxy.GetDNSServers()
 	if err != nil {
 		return nil, err
@@ -76,18 +81,22 @@ func NewVPN(addr, server, password, dns string, tcpTimeout, tcpDeadline, udpDead
 		return nil, err
 	}
 	t := gotun2socks.New(f, addr, []string{dns}, false, true)
-	return &VPN{
+	if err := limits.Raise(); err != nil {
+		log.Println("Try to raise system limits, got", err)
+	}
+	return &Tun{
 		Client:             c,
 		Tunnel:             tl,
 		Tun:                t,
 		ServerIP:           s,
 		TunGateway:         tunGateway,
 		OriginalDNSServers: ds,
+		RunnerGroup:        runnergroup.New(),
 	}, nil
 }
 
-// ListenAndServe starts to run VPN.
-func (v *VPN) ListenAndServe() error {
+// ListenAndServe starts to run Tun.
+func (v *Tun) ListenAndServe() error {
 	if err := sysproxy.SetDNSServers([]string{"127.0.0.1"}); err != nil {
 		return err
 	}
@@ -95,39 +104,42 @@ func (v *VPN) ListenAndServe() error {
 		return err
 	}
 
-	errch := make(chan error)
-	go func() {
-		errch <- v.Client.ListenAndServe()
-	}()
-	go func() {
-		errch <- v.Tunnel.ListenAndServe()
-	}()
-	go func() {
-		v.Tun.Run()
-	}()
-	return <-errch
+	v.RunnerGroup.Add(&runnergroup.Runner{
+		Start: func() error {
+			return v.Client.ListenAndServe()
+		},
+		Stop: func() error {
+			return v.Client.Shutdown()
+		},
+	})
+	v.RunnerGroup.Add(&runnergroup.Runner{
+		Start: func() error {
+			return v.Tunnel.ListenAndServe()
+		},
+		Stop: func() error {
+			return v.Tunnel.Shutdown()
+		},
+	})
+	v.RunnerGroup.Add(&runnergroup.Runner{
+		Start: func() error {
+			v.Tun.Run()
+			return nil
+		},
+		Stop: func() error {
+			v.Tun.Stop()
+			return nil
+		},
+	})
+	return v.RunnerGroup.Wait()
 }
 
-// Shutdown stops VPN.
-func (v *VPN) Shutdown() error {
+// Shutdown stops Tun.
+func (v *Tun) Shutdown() error {
 	if err := sysproxy.SetDNSServers(v.OriginalDNSServers); err != nil {
 		log.Println(err)
 	}
 	if err := v.DeleteRoutes(); err != nil {
 		log.Println(err)
 	}
-	if v.Client != nil {
-		if err := v.Client.Shutdown(); err != nil {
-			log.Println(err)
-		}
-	}
-	if v.Tunnel != nil {
-		if err := v.Tunnel.Shutdown(); err != nil {
-			log.Println(err)
-		}
-	}
-	if v.Tun != nil {
-		// v.Tun.Stop()
-	}
-	return nil
+	return v.RunnerGroup.Done()
 }

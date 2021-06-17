@@ -15,8 +15,12 @@
 package brook
 
 import (
+	"log"
 	"testing"
 )
 
 func TestTest(t *testing.T) {
+	log.Println(Link("brookwsserver", "ws://1.2.3.4:9999", "", "hello"))
+	k, a, b, c, _ := ParseLink(Link("brookwsserver", "ws://1.2.3.4:9999", "", "hello"))
+	log.Println(k, a, b, c)
 }

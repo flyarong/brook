@@ -1,3 +1,17 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
@@ -7,37 +21,29 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"strings"
 	"text/template"
 	"time"
 
 	"github.com/tdewolff/minify"
 	"github.com/tdewolff/minify/js"
-	"github.com/txthinking/x"
 )
 
 type PAC struct {
-	Addr string
-	File string
-	// global/white/black
+	Addr       string
+	File       string
 	Proxy      string
-	Mode       string
 	DomainURL  string
-	CidrURL    string
 	DomainData []byte
-	CidrData   []byte
 	HTTPServer *http.Server
 	Body       []byte
 }
 
-func NewPAC(addr, file, proxy, mode, domainURL, cidrURL string) *PAC {
+func NewPAC(addr, file, proxy, domainURL string) *PAC {
 	p := &PAC{
 		Addr:      addr,
 		File:      file,
 		Proxy:     proxy,
-		Mode:      mode,
 		DomainURL: domainURL,
-		CidrURL:   cidrURL,
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", p)
@@ -54,51 +60,13 @@ func NewPAC(addr, file, proxy, mode, domainURL, cidrURL string) *PAC {
 
 func (p *PAC) MakeBody() (io.Reader, error) {
 	var err error
+	l := make([]string, 0)
 	if p.DomainURL != "" {
-		p.DomainData, err = readURL(p.DomainURL)
+		l, err = ReadList(p.DomainURL)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if p.CidrURL != "" {
-		p.CidrData, err = readURL(p.CidrURL)
-		if err != nil {
-			return nil, err
-		}
-	}
-	ds := make([]string, 0)
-	if p.DomainData != nil {
-		b := bytes.TrimSpace(p.DomainData)
-		b = bytes.Replace(b, []byte{0x20}, []byte{}, -1)
-		b = bytes.Replace(b, []byte{0x0d, 0x0a}, []byte{0x0a}, -1)
-		ds = strings.Split(string(b), "\n")
-	}
-	cs := make([]map[string]int64, 0)
-	if p.CidrData != nil {
-		b := bytes.TrimSpace(p.CidrData)
-		b = bytes.Replace(b, []byte{0x20}, []byte{}, -1)
-		b = bytes.Replace(b, []byte{0x0d, 0x0a}, []byte{0x0a}, -1)
-		ss := strings.Split(string(b), "\n")
-		for _, s := range ss {
-			c, err := x.CIDR(s)
-			if err != nil {
-				continue
-			}
-			first, err := x.IP2Decimal(c.First)
-			if err != nil {
-				continue
-			}
-			last, err := x.IP2Decimal(c.Last)
-			if err != nil {
-				continue
-			}
-			m := make(map[string]int64)
-			m["first"] = first
-			m["last"] = last
-			cs = append(cs, m)
-		}
-	}
-
 	t := template.New("pac")
 	t, err = t.Parse(tpl)
 	if err != nil {
@@ -107,9 +75,7 @@ func (p *PAC) MakeBody() (io.Reader, error) {
 	b := &bytes.Buffer{}
 	if err := t.Execute(b, map[string]interface{}{
 		"proxy":   p.Proxy,
-		"mode":    p.Mode,
-		"domains": ds,
-		"cidrs":   cs,
+		"domains": l,
 	}); err != nil {
 		return nil, err
 	}
@@ -169,33 +135,8 @@ func (p *PAC) WriteToStdout() error {
 	return nil
 }
 
-func readURL(url string) ([]byte, error) {
-	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-		c := &http.Client{
-			Timeout: 9 * time.Second,
-		}
-		r, err := c.Get(url)
-		if err != nil {
-			return nil, err
-		}
-		defer r.Body.Close()
-		data, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			return nil, err
-		}
-		return data, nil
-	}
-	data, err := ioutil.ReadFile(url)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
 var tpl = `
 var proxy="{{.proxy}}";
-
-var mode = "{{.mode}}";
 
 var domains = {
 	{{range .domains}}
@@ -203,13 +144,7 @@ var domains = {
 	{{end}}
 };
 
-var cidrs = [
-    {{range .cidrs}}
-    [{{.first}},{{.last}}],
-	{{end}}
-];
-
-function ip2decimal(ip) {
+function ip4todecimal(ip) {
     var d = ip.split('.');
     return ((((((+d[0])*256)+(+d[1]))*256)+(+d[2]))*256)+(+d[3]);
 }
@@ -222,62 +157,18 @@ function FindProxyForURL(url, host){
                 isInNet(dnsResolve(host), "127.0.0.0", "255.255.255.0")){
             return "DIRECT";
         }
-		if(mode == "global"){
-			return proxy;
-		}
-        var d = ip2decimal(host);
-        var l = cidrs.length;
-        var min = 0;
-        var max = l;
-        for(;;){
-            if (min+1 > max) {
-                break;
-            }
-            var mid = Math.floor(min+(max-min)/2);
-            if(d >= cidrs[mid][0] && d <= cidrs[mid][1]){
-				if(mode == "white"){
-					return "DIRECT";
-				}
-				if(mode == "black"){
-					return proxy;
-				}
-            }else if(d < cidrs[mid][0]){
-                max = mid;
-            }else{
-                min = mid+1;
-            }
-        }
-		if(mode == "white"){
-			return proxy;
-		}
-		if(mode == "black"){
-			return "DIRECT";
-		}
+		return "DIRECT";
     }
-
     if (isPlainHostName(host)){
         return "DIRECT";
     }
 
-	if(mode == "global"){
-		return proxy;
-	}
     var a = host.split(".");
     for(var i=a.length-1; i>=0; i--){
         if (domains.hasOwnProperty(a.slice(i).join("."))){
-			if(mode == "white"){
-				return "DIRECT";
-			}
-			if(mode == "black"){
-				return proxy;
-			}
+			return "DIRECT";
         }
     }
-	if(mode == "white"){
-		return proxy;
-	}
-	if(mode == "black"){
-		return "DIRECT";
-	}
+	return proxy;
 }
 `
